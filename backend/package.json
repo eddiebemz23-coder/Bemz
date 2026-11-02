@@ -1,0 +1,58 @@
+{
+  "name": "bemz-africa-marketplace",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Bemz Africa Marketplace - e-commerce platform for Ugandan and Kenyan sellers and buyers",
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "db:up": "docker compose up -d postgres",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:seed": "prisma db seed",
+    "db:search": "psql \"$DATABASE_URL\" -f prisma/sql/search_vector.sql",
+    "db:studio": "prisma studio",
+    "db:reset": "prisma migrate reset --force",
+    "typecheck": "tsc --noEmit",
+    "postinstall": "prisma generate"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.22.0",
+    "autoprefixer": "^10.4.20",
+    "bcryptjs": "^2.4.3",
+    "cloudinary": "^2.5.2",
+    "clsx": "^2.1.1",
+    "date-fns": "^4.1.0",
+    "libphonenumber-js": "^1.11.14",
+    "lucide-react": "^0.454.0",
+    "nanoid": "^5.0.9",
+    "next": "^14.2.18",
+    "next-auth": "^4.24.10",
+    "postcss": "^8.4.47",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "server-only": "^0.0.1",
+    "stripe": "^17.4.0",
+    "tailwind-merge": "^2.5.4",
+    "tailwindcss": "^3.4.14",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^22.9.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "prisma": "^5.22.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

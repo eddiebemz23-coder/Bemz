@@ -1,0 +1,14 @@
+name: Release expired reservations
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -fsS -X POST "${{ vars.BEMZ_APP_URL }}/api/ops/expire-orders" \
+            -H "Authorization: Bearer ${{ secrets.BEMZ_OPS_SWEEP_TOKEN }}"

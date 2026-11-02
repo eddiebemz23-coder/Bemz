@@ -1,0 +1,1422 @@
+// Bemz Africa Marketplace — production Prisma schema
+// Conventions:
+//   * Every monetary amount is stored as an Int in MINOR units (UGX cents / KES cents / US cents).
+//     Never use Float for money. Currency is carried alongside every amount field.
+//   * Postgres `DECIMAL` is used only for aggregate ratings and commission percentages.
+//   * All timestamps are UTC (`timestamptz`), set by the database.
+//   * Soft deletes are used where history matters (products, variants, addresses) so orders keep referential snapshots.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  // Poolers (PgBouncer/Neon/Supabase) need a non-pooled connection for migrations.
+  directUrl = env("DIRECT_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  BUYER
+  SELLER
+  ADMIN
+}
+
+enum AccountStatus {
+  ACTIVE
+  PENDING_VERIFICATION
+  SUSPENDED
+  BANNED
+  DELETED
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+  UNDISCLOSED
+}
+
+enum CurrencyCode {
+  UGX // Uganda shilling
+  KES // Kenya shilling
+  USD // settlement / admin reporting only
+}
+
+enum CountryCode {
+  UG
+  KE
+}
+
+enum ShopStatus {
+  PENDING // created, awaiting first-listing or KYC
+  ACTIVE
+  SUSPENDED // admin action (dispute, fraud)
+  CLOSED
+}
+
+enum KycStatus {
+  NOT_SUBMITTED
+  SUBMITTED
+  UNDER_REVIEW
+  APPROVED
+  REJECTED
+}
+
+enum KycDocumentType {
+  NATIONAL_ID // Uganda NIN / Kenya national ID or passport
+  BUSINESS_REGISTRATION
+  TAX_PIN // Uganda URA TIN / Kenya KRA PIN
+  BANK_OR_MOMO_PROOF
+  FACE_VERIFICATION
+}
+
+enum ProductStatus {
+  DRAFT
+  PENDING_REVIEW // awaiting admin moderation
+  ACTIVE
+  REJECTED
+  ARCHIVED
+}
+
+enum ProductCondition {
+  NEW
+  USED
+  REFURBISHED
+}
+
+enum FulfilmentType {
+  SELLER_DELIVERY // seller hands to bemz courier at collection point
+  SELLER_SELF_DELIVERY // seller's own boda/bike
+  BUYER_PICKUP // pickup at seller shop
+  DIGITAL // instant delivery (airtime, vouchers, gift cards)
+}
+
+enum StockMovementReason {
+  PURCHASE_IN // seller restock
+  SALE
+  CANCELLATION_REVERSAL
+  RETURN
+  MANUAL_ADJUSTMENT
+  TRANSFER_IN
+  TRANSFER_OUT
+}
+
+enum OrderStatus {
+  AWAITING_PAYMENT
+  AWAITING_CONFIRMATION // OTP/phone or COD confirmation by seller
+  CONFIRMED
+  PACKED
+  OUT_FOR_DELIVERY
+  DELIVERED
+  CANCELLED
+  REFUNDED
+  FAILED
+}
+
+enum PaymentProvider {
+  MTN_MOMO
+  AIRTEL_MONEY
+  STRIPE_CARD
+  CASH_ON_DELIVERY
+}
+
+enum PaymentStatus {
+  INITIATED
+  PENDING_CUSTOMER // awaiting PIN prompt on handset
+  PROCESSING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+  EXPIRED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum PaymentPurpose {
+  ORDER
+  PAYOUT
+  SUBSCRIPTION // seller listing/subscription fee
+  WALLET_TOPUP
+}
+
+enum RefundStatus {
+  PENDING
+  PROCESSING
+  SUCCEEDED
+  FAILED
+}
+
+enum OrderCancellationBy {
+  BUYER
+  SELLER
+  ADMIN
+  SYSTEM
+}
+
+enum ShipmentStatus {
+  UNASSIGNED
+  LABEL_CREATED
+  PICKED_UP
+  IN_TRANSIT
+  AT_DELIVERY_HUB
+  OUT_FOR_DELIVERY
+  DELIVERED
+  FAILED_DELIVERY
+  RETURNED_TO_SENDER
+}
+
+enum ReviewTargetType {
+  PRODUCT
+  SHOP
+}
+
+enum ReviewStatus {
+  PUBLISHED
+  PENDING
+  REMOVED
+}
+
+enum CartStatus {
+  ACTIVE
+  CHECKOUT
+  ABANDONED
+  CONVERTED
+}
+
+enum WebhookProvider {
+  MTN_MOMO
+  AIRTEL_MONEY
+  STRIPE
+}
+
+enum WebhookProcessingStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  FAILED
+  IGNORED
+}
+
+enum CouponScope {
+  PLATFORM
+  SHOP
+}
+
+enum PromotionStatus {
+  DRAFT
+  SCHEDULED
+  ACTIVE
+  EXHAUSTED
+  EXPIRED
+  DISABLED
+}
+
+enum DiscountType {
+  PERCENTAGE
+  FIXED_AMOUNT
+  FREE_SHIPPING
+}
+
+enum PayoutStatus {
+  REQUESTED
+  APPROVED
+  SENT
+  FAILED
+  REVERSED
+}
+
+/// Where the platform sends a seller's money. Deliberately narrower than PaymentProvider:
+/// nobody pays a seller with a card, and cash-on-delivery is collected by the rider.
+enum PayoutProvider {
+  MTN_MOMO
+  AIRTEL_MONEY
+  BANK
+}
+
+enum NotificationChannel {
+  SMS
+  WHATSAPP
+  EMAIL
+  PUSH
+  IN_APP
+}
+
+enum NotificationStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  FAILED
+  READ
+}
+
+enum AdminAction {
+  PRODUCT_APPROVE
+  PRODUCT_REJECT
+  SHOP_SUSPEND
+  SHOP_RESTORE
+  USER_BAN
+  USER_UNBAN
+  ORDER_REFUND
+  PAYOUT_APPROVE
+  PAYOUT_MARK_SENT
+  PAYOUT_FAIL
+  PAYOUT_REVERSE
+  KYC_APPROVE
+  KYC_REJECT
+  COUPON_CREATE
+  COUPON_DISABLE
+  CATEGORY_UPDATE
+  ZONE_UPDATE
+  REVIEW_PUBLISH
+  REVIEW_REMOVE
+}
+
+enum AuditEntity {
+  USER
+  SHOP
+  PRODUCT
+  VARIANT
+  ORDER
+  PAYMENT
+  REVIEW
+  COUPON
+  CATEGORY
+  DELIVERY_ZONE
+  KYC_DOCUMENT
+  PAYOUT
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GEOGRAPHY — countries, regions, districts, delivery zones
+// Uganda has 130+ districts and Kenya 47 counties; both are modelled as `District`
+// so shipping pricing works identically in either market.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Country {
+  id            Int            @id @default(autoincrement())
+  code          CountryCode    @unique
+  name          String
+  currency      CurrencyCode
+  phonePrefix   String // "+256" / "+254"
+  taxRateBps    Int            @default(0) // VAT in basis points: UG=1800, KE=1600
+  taxLabel      String         @default("VAT")
+  isActive      Boolean        @default(true)
+  regions       Region[]
+  districts     District[]
+  deliveryZones DeliveryZone[]
+  shops         Shop[]
+  users         User[]
+  createdAt     DateTime       @default(now()) @db.Timestamptz(6)
+  updatedAt     DateTime       @updatedAt @db.Timestamptz(6)
+
+  @@map("countries")
+}
+
+model Region {
+  id        Int        @id @default(autoincrement())
+  countryId Int
+  country   Country    @relation(fields: [countryId], references: [id], onDelete: Cascade)
+  name      String // "Central Region", "Nairobi Metro"
+  code      String
+  districts District[]
+
+  @@unique([countryId, code])
+  @@index([countryId])
+  @@map("regions")
+}
+
+model District {
+  id             Int               @id @default(autoincrement())
+  countryId      Int
+  country        Country           @relation(fields: [countryId], references: [id], onDelete: Cascade)
+  regionId       Int?
+  region         Region?           @relation(fields: [regionId], references: [id], onDelete: SetNull)
+  code           String // "KLA" Kampala, "NRB" Nairobi
+  name           String // "Kampala", "Wakiso", "Kiambu"
+  isMajor        Boolean           @default(false) // true for Kampala / Nairobi / Entebbe / Mombasa corridors
+  zoneId         Int?
+  zone           DeliveryZone?     @relation(fields: [zoneId], references: [id], onDelete: SetNull)
+  addresses      ShippingAddress[]
+  orders         Order[]
+  shopsBasedHere Shop[]            @relation("ShopBaseLocation")
+
+  @@unique([countryId, code])
+  @@index([countryId, name])
+  @@index([zoneId])
+  @@map("districts")
+}
+
+/// A priced delivery band. Districts are assigned to exactly one zone; the zone
+/// decides the fee the buyer sees at checkout.
+model DeliveryZone {
+  id                    Int                @id @default(autoincrement())
+  countryId             Int
+  country               Country            @relation(fields: [countryId], references: [id], onDelete: Cascade)
+  code                  String // "UG-KAMPALA-1", "KE-NBO-1"
+  name                  String // "Kampala Metro", "Upcountry - East"
+  baseFeeMinor          Int // flat fee for the first standard parcel
+  perKgFeeMinor         Int                @default(0) // surcharge above the included weight
+  freeOverMinor         Int? // spend this much (same currency) and shipping is free
+  estimatedDaysMin      Int                @default(1)
+  estimatedDaysMax      Int                @default(5)
+  cashOnDeliveryAllowed Boolean            @default(true)
+  isActive              Boolean            @default(true)
+  districts             District[]
+  shippingEstimates     ShippingEstimate[]
+  orders                Order[]
+  createdAt             DateTime           @default(now()) @db.Timestamptz(6)
+  updatedAt             DateTime           @updatedAt @db.Timestamptz(6)
+
+  @@unique([countryId, code])
+  @@index([countryId, isActive])
+  @@map("delivery_zones")
+}
+
+/// Cached per-shop shipping behaviour for a zone (sellers can override the platform fee).
+model ShippingEstimate {
+  id               String       @id @default(cuid())
+  shopId           String
+  shop             Shop         @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  zoneId           Int
+  zone             DeliveryZone @relation(fields: [zoneId], references: [id], onDelete: Cascade)
+  feeOverrideMinor Int?
+  currency         CurrencyCode @default(UGX)
+  daysMin          Int          @default(1)
+  daysMax          Int          @default(7)
+  note             String?
+  updatedAt        DateTime     @updatedAt @db.Timestamptz(6)
+
+  @@unique([shopId, zoneId])
+  @@index([zoneId])
+  @@map("shipping_estimates")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// USERS & AUTH (NextAuth.js + phone/OTP which is the primary login path in UG/KE)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model User {
+  id                String        @id @default(cuid())
+  name              String?
+  email             String?       @unique
+  emailVerified     DateTime?     @db.Timestamptz(6)
+  /// E.164, e.g. +256772123456 / +254712345678. Primary identifier for this market.
+  phone             String?       @unique
+  phoneVerified     DateTime?     @db.Timestamptz(6)
+  /// Present only for credential (email+password) accounts; OTP users have no password.
+  passwordHash      String?
+  avatarUrl         String?
+  avatarPublicId    String? // Cloudinary public_id for deletion/replacement
+  role              UserRole      @default(BUYER)
+  status            AccountStatus @default(ACTIVE)
+  gender            Gender?
+  dateOfBirth       DateTime?     @db.Timestamptz(6)
+  countryId         Int?
+  country           Country?      @relation(fields: [countryId], references: [id], onDelete: SetNull)
+  preferredCurrency CurrencyCode  @default(UGX)
+  languageCode      String        @default("en") // en / sw (Swahili) / lg
+  marketingOptIn    Boolean       @default(false)
+  whatsappOptIn     Boolean       @default(true)
+  lastLoginAt       DateTime?     @db.Timestamptz(6)
+  failedLoginCount  Int           @default(0)
+  lockedUntil       DateTime?     @db.Timestamptz(6)
+  deletedAt         DateTime?     @db.Timestamptz(6)
+
+  accounts              Account[]
+  sessions              Session[]
+  addresses             ShippingAddress[]
+  carts                 Cart[]
+  orders                Order[]             @relation("BuyerOrders")
+  orderGroups           OrderGroup[]
+  reviews               Review[]
+  reviewVotes           ReviewVote[]
+  wishlistEntries       WishlistEntry[]
+  shopsOwned            Shop[]              @relation("ShopOwner")
+  productAnswers        ProductQuestion[]
+  productAnswersReplied ProductAnswer[]
+  inventoryMovements    InventoryMovement[]
+  couponRedemptions     CouponRedemption[]
+  promotions            Promotion[]
+  payouts               Payout[]
+  auditLogs             AuditLog[]
+  kycReviews            KycDocument[]       @relation("KycReviewer")
+  notifications         Notification[]
+  otpCodes              PhoneOtpCode[]
+  createdAt             DateTime            @default(now()) @db.Timestamptz(6)
+  updatedAt             DateTime            @updatedAt @db.Timestamptz(6)
+
+  @@index([role, status])
+  @@index([countryId])
+  @@map("users")
+}
+
+/// One-time passcodes for phone login/registration and order confirmation.
+/// Only the hash is stored, never the plaintext code.
+model PhoneOtpCode {
+  id          String    @id @default(cuid())
+  userId      String?
+  user        User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  phone       String
+  purpose     String    @default("LOGIN") // LOGIN | ORDER_CONFIRM | SELLER_VERIFY
+  codeHash    String
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(5)
+  expiresAt   DateTime  @db.Timestamptz(6)
+  consumedAt  DateTime? @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@index([phone, purpose, expiresAt])
+  @@index([userId])
+  @@map("phone_otp_codes")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider          String // "credentials" | "google" | "facebook"
+  providerAccountId String
+  type              String
+  access_token      String?
+  refresh_token     String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expires      DateTime @db.Timestamptz(6)
+  userAgent    String?
+  ip           String?
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime @db.Timestamptz(6)
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SHOPS / STORES
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Shop {
+  id                 String              @id @default(cuid())
+  ownerId            String
+  owner              User                @relation("ShopOwner", fields: [ownerId], references: [id], onDelete: Restrict)
+  name               String
+  slug               String              @unique
+  /// Legacy Jumia-style numeric store page, useful for share links like bemz.co.ug/store/4821
+  legacyStoreId      Int?                @unique
+  logoUrl            String?
+  logoPublicId       String?
+  bannerUrl          String?
+  bannerPublicId     String?
+  description        String?
+  tagline            String?
+  phone              String
+  whatsappNumber     String?
+  email              String?
+  countryId          Int
+  country            Country             @relation(fields: [countryId], references: [id], onDelete: Restrict)
+  /// Physical/collection location used for delivery estimates.
+  baseDistrictId     Int?
+  baseDistrict       District?           @relation("ShopBaseLocation", fields: [baseDistrictId], references: [id], onDelete: SetNull)
+  streetAddress      String?
+  status             ShopStatus          @default(PENDING)
+  isVerified         Boolean             @default(false)
+  isOfficialStore    Boolean             @default(false) // brand flagship
+  kycStatus          KycStatus           @default(NOT_SUBMITTED)
+  kycApprovedAt      DateTime?           @db.Timestamptz(6)
+  /// Identity captured with the KYC documents — required for tax invoices and disputes.
+  nationalIdNumber   String?
+  taxPin             String?
+  /// Registered business name when the stall trades as a company rather than a person.
+  kycBusinessName    String?
+  /// Platform commission in basis points (1250 = 12.5%). Overrides category rate when set.
+  commissionRateBps  Decimal?            @db.Decimal(5, 2)
+  ratingAvg          Decimal?            @db.Decimal(3, 2)
+  ratingCount        Int                 @default(0)
+  followers          Int                 @default(0)
+  totalSalesCount    Int                 @default(0)
+  totalSalesMinor    BigInt              @default(0)
+  /// Default fulfilment method advertised on product pages.
+  defaultFulfilment  FulfilmentType      @default(SELLER_DELIVERY)
+  dispatchSlaHours   Int                 @default(48)
+  /// Seller can pause shopping without delisting (market-stall / holiday mode).
+  vacationMode       Boolean             @default(false)
+  payoutAccount      PayoutAccount?
+  products           Product[]
+  shopCategories     ShopCategory[]
+  payouts            Payout[]
+  reviews            Review[]
+  orders             Order[]
+  shippingEstimates  ShippingEstimate[]
+  kycDocuments       KycDocument[]
+  coupons            Coupon[]
+  promotions         Promotion[]
+  inventoryMovements InventoryMovement[]
+  deletedAt          DateTime?           @db.Timestamptz(6)
+  createdAt          DateTime            @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime            @updatedAt @db.Timestamptz(6)
+
+  @@index([status, isVerified])
+  @@index([ownerId])
+  @@index([countryId, status])
+  @@index([ratingAvg(sort: Desc)])
+  @@map("shops")
+}
+
+/// Mobile-money-first payout destination: MTN MoMo / Airtel Money number, with bank as fallback.
+model PayoutAccount {
+  id            String          @id @default(cuid())
+  shopId        String          @unique
+  shop          Shop            @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  provider      PayoutProvider  @default(MTN_MOMO)
+  accountNumber String // MoMo MSISDN or bank account number
+  accountName   String
+  bankName      String?
+  isDefault     Boolean         @default(true)
+  isVerified    Boolean         @default(false)
+  verifiedAt    DateTime?       @db.Timestamptz(6)
+  payouts       Payout[]
+  createdAt     DateTime        @default(now()) @db.Timestamptz(6)
+  updatedAt     DateTime        @updatedAt @db.Timestamptz(6)
+
+  @@index([provider, accountNumber])
+  @@map("payout_accounts")
+}
+
+model Payout {
+  id                String        @id @default(cuid())
+  shopId            String
+  shop              Shop          @relation(fields: [shopId], references: [id], onDelete: Restrict)
+  accountId         String
+  account           PayoutAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  amountMinor       BigInt
+  currency          CurrencyCode
+  status            PayoutStatus  @default(REQUESTED)
+  periodStart       DateTime      @db.Timestamptz(6)
+  periodEnd         DateTime      @db.Timestamptz(6)
+  providerReference String?       @unique
+  failureReason     String?
+  processedById     String?
+  processedBy       User?         @relation(fields: [processedById], references: [id], onDelete: SetNull)
+  processedAt       DateTime?     @db.Timestamptz(6)
+  createdAt         DateTime      @default(now()) @db.Timestamptz(6)
+
+  @@index([shopId, status])
+  @@index([status, createdAt])
+  @@map("payouts")
+}
+
+model KycDocument {
+  id         String          @id @default(cuid())
+  shopId     String
+  shop       Shop            @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  type       KycDocumentType
+  /// Cloudinary secure_url; national IDs are access-restricted, never public CDN links.
+  fileUrl    String
+  publicId   String
+  status     KycStatus       @default(SUBMITTED)
+  reviewerId String?
+  reviewer   User?           @relation("KycReviewer", fields: [reviewerId], references: [id], onDelete: SetNull)
+  reviewNote String?
+  reviewedAt DateTime?       @db.Timestamptz(6)
+  expiresAt  DateTime?       @db.Timestamptz(6)
+  createdAt  DateTime        @default(now()) @db.Timestamptz(6)
+
+  @@unique([shopId, type])
+  @@index([status])
+  @@map("kyc_documents")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TAXONOMY
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Category {
+  id                String            @id @default(cuid())
+  name              String
+  slug              String            @unique
+  parentId          String?
+  parent            Category?         @relation("CategoryTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children          Category[]        @relation("CategoryTree")
+  /// Materialised path for O(1) breadcrumb + subtree queries: "electronics/phones/smartphones"
+  path              String
+  depth             Int               @default(0)
+  imageUrl          String?
+  imagePublicId     String?
+  icon              String?
+  description       String?
+  /// Platform commission applied to items sold here (basis points) unless the shop overrides it.
+  commissionRateBps Int               @default(1000)
+  /// Sellers must supply KYC before listing in protected categories (phones, tablets, gold).
+  requiresKyc       Boolean           @default(false)
+  isFlat            Boolean           @default(false) // no seller override of shipping
+  sortOrder         Int               @default(0)
+  isActive          Boolean           @default(true)
+  productCategories ProductCategory[]
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@index([parentId])
+  @@index([path])
+  @@index([isActive, sortOrder])
+  @@map("categories")
+}
+
+/// Sellers curate a storefront sub-taxonomy on top of platform categories.
+model ShopCategory {
+  id        String         @id @default(cuid())
+  shopId    String
+  shop      Shop           @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  name      String
+  slug      String
+  parentId  String?
+  parent    ShopCategory?  @relation("ShopCategoryTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children  ShopCategory[] @relation("ShopCategoryTree")
+  sortOrder Int            @default(0)
+  products  Product[]
+
+  @@unique([shopId, slug])
+  @@index([shopId, parentId])
+  @@map("shop_categories")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PRODUCTS, VARIANTS, IMAGES, STOCK
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Product {
+  id                 String                   @id @default(cuid())
+  shopId             String
+  shop               Shop                     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  shopCategoryId     String?
+  shopCategory       ShopCategory?            @relation(fields: [shopCategoryId], references: [id], onDelete: SetNull)
+  title              String
+  /// URL-safe, shop-scoped: /product/{shop-slug}/{slug}
+  slug               String
+  subtitle           String?
+  description        String
+  descriptionHtml    String?
+  brand              String?
+  condition          ProductCondition         @default(NEW)
+  status             ProductStatus            @default(DRAFT)
+  fulfilmentType     FulfilmentType           @default(SELLER_DELIVERY)
+  warrantyText       String? // "12 months official distributor warranty"
+  /// Display price shown on listings = cheapest active variant, maintained by the API.
+  startingPriceMinor Int?
+  currency           CurrencyCode             @default(UGX)
+  /// Same as starting price but against `compareAtPriceMinor`, powers the "−45%" badge.
+  discountPct        Int?
+  sku                String?                  @unique // seller-facing master SKU
+  barcode            String? // EAN/UPC for graded/grocery items
+  weightGrams        Int?
+  lengthCm           Decimal?                 @db.Decimal(6, 2)
+  widthCm            Decimal?                 @db.Decimal(6, 2)
+  heightCm           Decimal?                 @db.Decimal(6, 2)
+  /// Digital goods (airtime, vouchers) deliver a code instead of a parcel.
+  isDigital          Boolean                  @default(false)
+  requiresModeration Boolean                  @default(true)
+  rejectionReason    String?
+  moderatedAt        DateTime?                @db.Timestamptz(6)
+  moderatedById      String?
+  viewsCount         Int                      @default(0)
+  wishlistsCount     Int                      @default(0)
+  soldCount          Int                      @default(0)
+  ratingAvg          Decimal?                 @db.Decimal(3, 2)
+  ratingCount        Int                      @default(0)
+  /// Denormalised search payload for Postgres full-text / trigram search.
+  searchVector       Unsupported("tsvector")?
+  metaTitle          String?
+  metaDescription    String?
+  deletedAt          DateTime?                @db.Timestamptz(6)
+  createdAt          DateTime                 @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime                 @updatedAt @db.Timestamptz(6)
+
+  variants        ProductVariant[]
+  images          ProductImage[]
+  categories      ProductCategory[]
+  attributes      ProductAttribute[]
+  reviews         Review[]
+  questions       ProductQuestion[]
+  wishlistEntries WishlistEntry[]
+  coupons         Coupon[]
+  promotions      PromotionProduct[]
+
+  @@unique([shopId, slug])
+  @@index([shopId, status])
+  @@index([status, startingPriceMinor])
+  @@index([brand])
+  @@index([createdAt(sort: Desc)])
+  @@index([deletedAt])
+  @@map("products")
+}
+
+/// Many-to-many product ↔ platform category with one primary.
+model ProductCategory {
+  productId  String
+  product    Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  categoryId String
+  category   Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  isPrimary  Boolean  @default(false)
+
+  @@id([productId, categoryId])
+  @@index([categoryId, isPrimary])
+  @@map("product_categories")
+}
+
+/// A purchasable unit: colour/storage/size for phones and clothing, pack size for groceries.
+/// Attribute combinations live in `attributes` (JSONB) so sellers can add axes without migrations.
+model ProductVariant {
+  id                  String              @id @default(cuid())
+  productId           String
+  product             Product             @relation(fields: [productId], references: [id], onDelete: Cascade)
+  sku                 String              @unique // global unique, e.g. "BMZ-PH-TEC-A56-128-BLK"
+  name                String // "128GB / Black"
+  attributes          Json                @default("{}") @db.JsonB
+  priceMinor          Int
+  compareAtPriceMinor Int?
+  currency            CurrencyCode        @default(UGX)
+  costPriceMinor      Int? // seller's own cost, never exposed publicly
+  /// On-hand quantity at the seller's stock location.
+  stockQuantity       Int                 @default(0)
+  /// Held for in-flight carts/checkout so two buyers cannot oversell the last unit.
+  reservedQuantity    Int                 @default(0)
+  lowStockThreshold   Int                 @default(5)
+  maxQuantityPerOrder Int? // rice/airtime rationing
+  weightGrams         Int?
+  images              ProductImage[]
+  inventoryMovements  InventoryMovement[]
+  cartItems           CartItem[]
+  orderItems          OrderItem[]
+  isPrimary           Boolean             @default(false)
+  isDisabled          Boolean             @default(false)
+  deletedAt           DateTime?           @db.Timestamptz(6)
+  createdAt           DateTime            @default(now()) @db.Timestamptz(6)
+  updatedAt           DateTime            @updatedAt @db.Timestamptz(6)
+
+  @@index([productId, isDisabled])
+  @@index([stockQuantity])
+  @@index([priceMinor])
+  @@map("product_variants")
+}
+
+/// Stock ledger — every movement is a row, so seller stock counts are auditable and reversible.
+model InventoryMovement {
+  id             String              @id @default(cuid())
+  variantId      String
+  variant        ProductVariant      @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  shopId         String
+  shop           Shop                @relation(fields: [shopId], references: [id], onDelete: Restrict)
+  reason         StockMovementReason
+  /// Signed change in units: +50 restock, -1 sale.
+  delta          Int
+  balanceAfter   Int
+  orderId        String?
+  order          Order?              @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  actorId        String?
+  actor          User?               @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  note           String?
+  idempotencyKey String?             @unique
+  createdAt      DateTime            @default(now()) @db.Timestamptz(6)
+
+  @@index([variantId, createdAt(sort: Desc)])
+  @@index([shopId, createdAt(sort: Desc)])
+  @@map("inventory_movements")
+}
+
+/// Product gallery plus per-variant swatches; `variantId` null = product-level image.
+model ProductImage {
+  id        String          @id @default(cuid())
+  productId String
+  product   Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variantId String?
+  variant   ProductVariant? @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  url       String // Cloudinary secure_url
+  publicId  String // Cloudinary public_id, used for destroy()
+  thumbUrl  String?
+  altText   String?
+  position  Int             @default(0)
+  isPrimary Boolean         @default(false)
+  createdAt DateTime        @default(now()) @db.Timestamptz(6)
+
+  @@index([productId, position])
+  @@index([variantId])
+  @@map("product_images")
+}
+
+/// Search/filter facets declared per product, e.g. RAM, Screen size, Colour options.
+model ProductAttribute {
+  id        String  @id @default(cuid())
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  name      String // "Storage", "Colour"
+  value     String // "128GB", "Gold"
+  position  Int     @default(0)
+
+  @@unique([productId, name, value])
+  @@index([productId])
+  @@map("product_attributes")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CART
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Cart {
+  id            String       @id @default(cuid())
+  userId        String?
+  user          User?        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Anonymous carts are keyed by a signed cookie value so guests can convert to an account later.
+  guestToken    String?      @unique
+  status        CartStatus   @default(ACTIVE)
+  currency      CurrencyCode @default(UGX)
+  countryId     Int?
+  items         CartItem[]
+  couponId      String?
+  coupon        Coupon?      @relation(fields: [couponId], references: [id], onDelete: SetNull)
+  itemsCount    Int          @default(0)
+  subtotalMinor Int          @default(0)
+  expiresAt     DateTime?    @db.Timestamptz(6)
+  createdAt     DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt     DateTime     @updatedAt @db.Timestamptz(6)
+
+  @@unique([userId, status])
+  @@index([status, updatedAt])
+  @@map("carts")
+}
+
+model CartItem {
+  id             String         @id @default(cuid())
+  cartId         String
+  cart           Cart           @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  variantId      String
+  variant        ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  quantity       Int            @default(1)
+  /// Price captured when added, so a seller's price change cannot silently alter a basket.
+  unitPriceMinor Int
+  currency       CurrencyCode   @default(UGX)
+  selected       Boolean        @default(true)
+  addedAt        DateTime       @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime       @updatedAt @db.Timestamptz(6)
+
+  @@unique([cartId, variantId])
+  @@index([variantId])
+  @@map("cart_items")
+}
+
+model WishlistEntry {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  @@unique([userId, productId])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("wishlist_entries")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SHIPPING ADDRESSES
+// ─────────────────────────────────────────────────────────────────────────────
+
+model ShippingAddress {
+  id               String    @id @default(cuid())
+  userId           String
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  label            String?   @default("Home") // Home / Office / Kikuubo stall
+  recipientName    String
+  /// Landmarks matter more than street names in Kampala/Nairobi informal addressing.
+  recipientPhone   String
+  alternativePhone String?
+  countryId        Int
+  districtId       Int
+  district         District  @relation(fields: [districtId], references: [id], onDelete: Restrict)
+  subcounty        String? // town division / ward / sub-county
+  parish           String? // local parish / estate
+  village          String?
+  streetAddress    String?
+  nearestLandmark  String? // "Next to Night Market, Wandegeya"
+  deliveryNote     String? // "Call on arrival, gate is locked"
+  lat              Decimal?  @db.Decimal(9, 6)
+  lng              Decimal?  @db.Decimal(9, 6)
+  pinCode          String? // Kenya postal code / Uganda rarely used
+  isDefault        Boolean   @default(false)
+  archivedAt       DateTime? @db.Timestamptz(6)
+  createdAt        DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt        DateTime  @updatedAt @db.Timestamptz(6)
+
+  @@index([userId, isDefault])
+  @@index([districtId])
+  @@map("shipping_addresses")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ORDERS
+// A buyer's multi-seller basket is split into one order per shop at checkout,
+// grouped by `OrderGroup` so the buyer sees a single confirmation.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model OrderGroup {
+  id         String       @id @default(cuid())
+  reference  String       @unique // "BMG-20261029-8F3K2Q"
+  userId     String
+  user       User         @relation(fields: [userId], references: [id], onDelete: Restrict)
+  currency   CurrencyCode @default(UGX)
+  totalMinor BigInt
+  orders     Order[]
+  createdAt  DateTime     @default(now()) @db.Timestamptz(6)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("order_groups")
+}
+
+model Order {
+  id          String       @id @default(cuid())
+  orderNumber String       @unique // "BMZ-UG-2026-000123"
+  groupId     String?
+  group       OrderGroup?  @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  buyerId     String
+  buyer       User         @relation("BuyerOrders", fields: [buyerId], references: [id], onDelete: Restrict)
+  shopId      String
+  shop        Shop         @relation(fields: [shopId], references: [id], onDelete: Restrict)
+  status      OrderStatus  @default(AWAITING_PAYMENT)
+  currency    CurrencyCode @default(UGX)
+
+  // ── money (minor units) ──
+  subtotalMinor    BigInt
+  discountMinor    BigInt @default(0)
+  shippingFeeMinor BigInt @default(0)
+  taxMinor         BigInt @default(0)
+  platformFeeMinor BigInt @default(0) // commission held back from seller payout
+  totalMinor       BigInt
+  amountPaidMinor  BigInt @default(0)
+  refundedMinor    BigInt @default(0)
+
+  // ── delivery snapshot (immutable history, even if the address is edited later) ──
+  shippingAddressSnapshot Json           @db.JsonB
+  districtId              Int?
+  district                District?      @relation(fields: [districtId], references: [id], onDelete: SetNull)
+  deliveryZoneId          Int?
+  deliveryZone            DeliveryZone?  @relation(fields: [deliveryZoneId], references: [id], onDelete: SetNull)
+  recipientName           String?
+  recipientPhone          String?
+  deliveryNote            String?
+  fulfilmentType          FulfilmentType @default(SELLER_DELIVERY)
+
+  // ── shipping / courier ──
+  shipmentStatus      ShipmentStatus @default(UNASSIGNED)
+  trackingNumber      String?        @unique
+  courierName         String?
+  estimatedDeliveryAt DateTime?      @db.Timestamptz(6)
+
+  couponId String?
+  coupon   Coupon? @relation(fields: [couponId], references: [id], onDelete: SetNull)
+
+  items              OrderItem[]
+  payments           Payment[]
+  refunds            Refund[]
+  reviews            Review[]
+  inventoryMovements InventoryMovement[]
+  statusHistory      OrderStatusEvent[]
+  cancellationReason String?
+  cancelledBy        OrderCancellationBy?
+  cancelledAt        DateTime?            @db.Timestamptz(6)
+  confirmedAt        DateTime?            @db.Timestamptz(6)
+  packedAt           DateTime?            @db.Timestamptz(6)
+  shippedAt          DateTime?            @db.Timestamptz(6)
+  deliveredAt        DateTime?            @db.Timestamptz(6)
+  sellerNote         String?
+  buyerNote          String?
+  placedAt           DateTime             @db.Timestamptz(6)
+  expiresAt          DateTime?            @db.Timestamptz(6) // unpaid reservation TTL
+  createdAt          DateTime             @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime             @updatedAt @db.Timestamptz(6)
+
+  @@index([buyerId, createdAt(sort: Desc)])
+  @@index([shopId, status, createdAt(sort: Desc)])
+  @@index([status, placedAt])
+  @@index([deliveryZoneId])
+  @@index([shipmentStatus])
+  @@map("orders")
+}
+
+/// Line items freeze product/variant/price/stock details at purchase time.
+model OrderItem {
+  id                String         @id @default(cuid())
+  orderId           String
+  order             Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  variantId         String
+  variant           ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  productId         String
+  // snapshots
+  productTitle      String
+  variantName       String
+  sku               String
+  shopName          String
+  imageUrl          String?
+  unitPriceMinor    Int
+  currency          CurrencyCode   @default(UGX)
+  quantity          Int
+  /// Line-level discount share from a platform or shop coupon.
+  discountMinor     Int            @default(0)
+  commissionMinor   Int            @default(0)
+  totalMinor        Int
+  deliveredQuantity Int            @default(0)
+  returnedQuantity  Int            @default(0)
+  createdAt         DateTime       @default(now()) @db.Timestamptz(6)
+
+  @@index([orderId])
+  @@index([variantId])
+  @@index([productId])
+  @@map("order_items")
+}
+
+/// Append-only state machine log — drives the buyer's "where is my order" timeline.
+model OrderStatusEvent {
+  id        String       @id @default(cuid())
+  orderId   String
+  order     Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  from      OrderStatus?
+  to        OrderStatus
+  note      String?
+  actorId   String?
+  createdAt DateTime     @default(now()) @db.Timestamptz(6)
+
+  @@index([orderId, createdAt])
+  @@map("order_status_events")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PAYMENTS — MTN MoMo, Airtel Money, Stripe cards, cash on delivery
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Payment {
+  id          String          @id @default(cuid())
+  orderId     String?
+  order       Order?          @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  purpose     PaymentPurpose  @default(ORDER)
+  provider    PaymentProvider
+  status      PaymentStatus   @default(INITIATED)
+  amountMinor BigInt
+  feeMinor    BigInt          @default(0)
+  currency    CurrencyCode    @default(UGX)
+
+  // ── mobile money (MTN MoMo / Airtel Money) ──
+  payerPhone        String? // MSISDN the PIN prompt was sent to
+  payerName         String? // name returned by the operator, shown for confirmation
+  providerReference String? // MoMo financial transaction id / Stripe PaymentIntent id
+  clientCheckoutId  String? // MTN "friendly payment" checkout token
+  externalId        String         @unique // our idempotent request id sent to the provider
+  requestedAt       DateTime?      @db.Timestamptz(6)
+  completedAt       DateTime?      @db.Timestamptz(6)
+  expiresAt         DateTime?      @db.Timestamptz(6)
+  failureCode       String?
+  failureReason     String?
+  retryCount        Int            @default(0)
+  rawRequest        Json?          @db.JsonB
+  rawResponse       Json?          @db.JsonB
+  refunds           Refund[]
+  webhookEvents     WebhookEvent[]
+  createdAt         DateTime       @default(now()) @db.Timestamptz(6)
+  updatedAt         DateTime       @updatedAt @db.Timestamptz(6)
+
+  @@index([orderId, status])
+  @@index([provider, status, createdAt])
+  @@index([providerReference])
+  @@index([payerPhone])
+  @@map("payments")
+}
+
+model Refund {
+  id                String       @id @default(cuid())
+  paymentId         String
+  payment           Payment      @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  orderId           String
+  order             Order        @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  amountMinor       BigInt
+  currency          CurrencyCode @default(UGX)
+  status            RefundStatus @default(PENDING)
+  reason            String?
+  providerReference String?      @unique
+  processedById     String?
+  processedAt       DateTime?    @db.Timestamptz(6)
+  createdAt         DateTime     @default(now()) @db.Timestamptz(6)
+
+  @@index([orderId])
+  @@index([status, createdAt])
+  @@map("refunds")
+}
+
+/// Idempotency + audit for operator/card callbacks. Payloads are stored as received
+/// (secrets stripped) so reconciliation disputes can be replayed.
+model WebhookEvent {
+  id              String                  @id @default(cuid())
+  provider        WebhookProvider
+  eventType       String
+  /// Provider's own unique id — dedupe key.
+  providerEventId String?
+  payload         Json                    @db.JsonB
+  signatureValid  Boolean                 @default(false)
+  paymentId       String?
+  payment         Payment?                @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  status          WebhookProcessingStatus @default(RECEIVED)
+  attempts        Int                     @default(0)
+  error           String?
+  receivedAt      DateTime                @default(now()) @db.Timestamptz(6)
+  processedAt     DateTime?               @db.Timestamptz(6)
+
+  @@unique([provider, providerEventId])
+  @@index([paymentId])
+  @@index([status, receivedAt])
+  @@map("webhook_events")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REVIEWS, QUESTIONS & ANSWERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Review {
+  id                 String           @id @default(cuid())
+  userId             String
+  user               User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  targetType         ReviewTargetType
+  productId          String?
+  product            Product?         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  shopId             String?
+  shop               Shop?            @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  orderId            String?
+  order              Order?           @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  votes              ReviewVote[]
+  rating             Int // 1..5
+  title              String?
+  body               String
+  images             Json             @default("[]") @db.JsonB // Cloudinary URLs
+  /// Only buyers with a delivered order line for this item can leave a verified review.
+  isVerifiedPurchase Boolean          @default(false)
+  status             ReviewStatus     @default(PUBLISHED)
+  sellerReply        String?
+  sellerRepliedAt    DateTime?        @db.Timestamptz(6)
+  helpfulCount       Int              @default(0)
+  rejectionReason    String?
+  createdAt          DateTime         @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime         @updatedAt @db.Timestamptz(6)
+
+  @@index([productId, status, createdAt(sort: Desc)])
+  @@index([shopId, status, createdAt(sort: Desc)])
+  @@index([userId])
+  @@index([rating])
+  @@map("reviews")
+}
+
+/// One "helpful" tap per person per review. Without the unique pair this counter would be
+/// a number anyone can inflate with a loop.
+model ReviewVote {
+  id       String   @id @default(cuid())
+  reviewId String
+  review   Review   @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  userId   String
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  helpful  Boolean  @default(true)
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  @@unique([reviewId, userId])
+  @@index([userId])
+  @@map("review_votes")
+}
+
+model ProductQuestion {
+  id        String          @id @default(cuid())
+  productId String
+  product   Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  body      String
+  answers   ProductAnswer[]
+  createdAt DateTime        @default(now()) @db.Timestamptz(6)
+
+  @@index([productId, createdAt])
+  @@map("product_questions")
+}
+
+model ProductAnswer {
+  id           String          @id @default(cuid())
+  questionId   String
+  question     ProductQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  responderId  String
+  responder    User            @relation(fields: [responderId], references: [id], onDelete: Cascade)
+  /// Sellers answer their own questions; the platform badge distinguishes official replies.
+  isFromSeller Boolean         @default(true)
+  body         String
+  createdAt    DateTime        @default(now()) @db.Timestamptz(6)
+
+  @@index([questionId])
+  @@map("product_answers")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COUPONS & PROMOTIONS
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Coupon {
+  id                String             @id @default(cuid())
+  code              String             @unique
+  name              String
+  scope             CouponScope        @default(PLATFORM)
+  shopId            String?
+  shop              Shop?              @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  discountType      DiscountType       @default(PERCENTAGE)
+  /// Percentage off in basis points (1000 = 10%) when discountType = PERCENTAGE.
+  valueBps          Int?
+  /// Flat amount in minor units when discountType = FIXED_AMOUNT.
+  fixedAmountMinor  Int?
+  maxDiscountMinor  Int?
+  minOrderMinor     Int?
+  currency          CurrencyCode       @default(UGX)
+  isStorewide       Boolean            @default(true)
+  products          Product[]
+  carts             Cart[]
+  orders            Order[]
+  redemptions       CouponRedemption[]
+  startsAt          DateTime           @db.Timestamptz(6)
+  endsAt            DateTime           @db.Timestamptz(6)
+  usageLimitTotal   Int?
+  usageLimitPerUser Int?               @default(1)
+  usedCount         Int                @default(0)
+  isActive          Boolean            @default(true)
+  createdAt         DateTime           @default(now()) @db.Timestamptz(6)
+  updatedAt         DateTime           @updatedAt @db.Timestamptz(6)
+
+  @@index([shopId, isActive])
+  @@index([startsAt, endsAt])
+  @@map("coupons")
+}
+
+/// Per-user usage tracking so `usageLimitPerUser` and `usageLimitTotal` are enforceable
+/// atomically at checkout instead of trusting the denormalised `usedCount`.
+model CouponRedemption {
+  id            String       @id @default(cuid())
+  couponId      String
+  coupon        Coupon       @relation(fields: [couponId], references: [id], onDelete: Restrict)
+  userId        String
+  user          User         @relation(fields: [userId], references: [id], onDelete: Restrict)
+  orderId       String       @unique
+  discountMinor Int
+  currency      CurrencyCode @default(UGX)
+  createdAt     DateTime     @default(now()) @db.Timestamptz(6)
+
+  @@index([couponId, userId])
+  @@map("coupon_redemptions")
+}
+
+/// Flash deals / "Mid-Year Sale" bundles — the sales mechanic Jumia-like buyers expect.
+model Promotion {
+  id             String             @id @default(cuid())
+  name           String
+  slug           String             @unique
+  scope          CouponScope        @default(PLATFORM)
+  shopId         String?
+  shop           Shop?              @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  status         PromotionStatus    @default(DRAFT)
+  startsAt       DateTime           @db.Timestamptz(6)
+  endsAt         DateTime           @db.Timestamptz(6)
+  bannerUrl      String?
+  bannerPublicId String?
+  description    String?
+  createdBy      String
+  creator        User               @relation(fields: [createdBy], references: [id], onDelete: Restrict)
+  products       PromotionProduct[]
+  createdAt      DateTime           @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime           @updatedAt @db.Timestamptz(6)
+
+  @@index([status, startsAt])
+  @@map("promotions")
+}
+
+model PromotionProduct {
+  id             String       @id @default(cuid())
+  promotionId    String
+  promotion      Promotion    @relation(fields: [promotionId], references: [id], onDelete: Cascade)
+  productId      String
+  product        Product      @relation(fields: [productId], references: [id], onDelete: Cascade)
+  /// Deal price override for this campaign only.
+  dealPriceMinor Int
+  currency       CurrencyCode @default(UGX)
+  quota          Int          @default(0)
+  sold           Int          @default(0)
+  position       Int          @default(0)
+
+  @@unique([promotionId, productId])
+  @@index([productId])
+  @@map("promotion_products")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NOTIFICATIONS & ADMIN
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Notification {
+  id                String              @id @default(cuid())
+  userId            String
+  user              User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel           NotificationChannel
+  status            NotificationStatus  @default(QUEUED)
+  template          String
+  title             String?
+  body              String?
+  data              Json                @default("{}") @db.JsonB
+  providerMessageId String?
+  readAt            DateTime?           @db.Timestamptz(6)
+  sentAt            DateTime?           @db.Timestamptz(6)
+  createdAt         DateTime            @default(now()) @db.Timestamptz(6)
+
+  @@index([userId, status, createdAt(sort: Desc)])
+  @@map("notifications")
+}
+
+/// Every privileged mutation is written here — refunds, bans, KYC decisions, payouts.
+model AuditLog {
+  id        String      @id @default(cuid())
+  actorId   String
+  actor     User        @relation(fields: [actorId], references: [id], onDelete: Restrict)
+  action    AdminAction
+  entity    AuditEntity
+  entityId  String
+  before    Json?       @db.JsonB
+  after     Json?       @db.JsonB
+  reason    String?
+  ip        String?
+  userAgent String?
+  createdAt DateTime    @default(now()) @db.Timestamptz(6)
+
+  @@index([entity, entityId, createdAt(sort: Desc)])
+  @@index([actorId, createdAt(sort: Desc)])
+  @@map("audit_logs")
+}
