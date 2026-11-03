@@ -19,7 +19,7 @@
     "db:search": "psql \"$DATABASE_URL\" -f prisma/sql/search_vector.sql",
     "db:studio": "prisma studio",
     "db:reset": "prisma migrate reset --force",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",
